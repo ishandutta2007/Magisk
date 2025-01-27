@@ -8,6 +8,9 @@ use p256::pkcs8::DecodePrivateKey;
 use p384::ecdsa::{
     Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey,
 };
+use p521::ecdsa::{
+    Signature as P521Signature, SigningKey as P521SigningKey, VerifyingKey as P521VerifyingKey,
+};
 use rsa::pkcs1v15::{
     Signature as RsaSignature, SigningKey as RsaSigningKey, VerifyingKey as RsaVerifyingKey,
 };
@@ -16,7 +19,7 @@ use rsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use rsa::signature::SignatureEncoding;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
-use sha2::{Sha256, Sha384};
+use sha2::{Sha256, Sha384, Sha512};
 use x509_cert::der::asn1::{OctetString, PrintableString};
 use x509_cert::der::Any;
 use x509_cert::spki::AlgorithmIdentifier;
@@ -82,6 +85,7 @@ enum SigningKey {
     SHA256withRSA(RsaSigningKey<Sha256>),
     SHA256withECDSA(P256SigningKey),
     SHA384withECDSA(P384SigningKey),
+    SHA521withECDSA(P521SigningKey),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -89,6 +93,7 @@ enum VerifyingKey {
     SHA256withRSA(RsaVerifyingKey<Sha256>),
     SHA256withECDSA(P256VerifyingKey),
     SHA384withECDSA(P384VerifyingKey),
+    SHA521withECDSA(P521VerifyingKey),
 }
 
 struct Verifier {
@@ -108,6 +113,9 @@ impl Verifier {
         } else if let Ok(ec) = P384VerifyingKey::try_from(key.clone()) {
             digest = Box::<Sha384>::default();
             VerifyingKey::SHA384withECDSA(ec)
+        } else if let Ok(ec) = P521VerifyingKey::try_from(key.clone()) {
+            digest = Box::<Sha512>::default();
+            VerifyingKey::SHA521withECDSA(ec)
         } else {
             return Err(log_err!("Unsupported private key"));
         };
@@ -120,7 +128,7 @@ impl Verifier {
 
     fn verify(mut self, signature: &[u8]) -> LoggedResult<()> {
         let hash = self.digest.finalize_reset();
-        return match &self.key {
+        match &self.key {
             VerifyingKey::SHA256withRSA(key) => {
                 let sig = RsaSignature::try_from(signature)?;
                 key.verify_prehash(hash.as_ref(), &sig).log()
@@ -133,7 +141,11 @@ impl Verifier {
                 let sig = P384Signature::from_slice(signature)?;
                 key.verify_prehash(hash.as_ref(), &sig).log()
             }
-        };
+            VerifyingKey::SHA521withECDSA(key) => {
+                let sig = P521Signature::from_slice(signature)?;
+                key.verify_prehash(hash.as_ref(), &sig).log()
+            }
+        }
     }
 }
 
@@ -154,6 +166,9 @@ impl Signer {
         } else if let Ok(ec) = P384SigningKey::from_pkcs8_der(key) {
             digest = Box::<Sha384>::default();
             SigningKey::SHA384withECDSA(ec)
+        } else if let Ok(ec) = P521SigningKey::from_pkcs8_der(key) {
+            digest = Box::<Sha512>::default();
+            SigningKey::SHA521withECDSA(ec)
         } else {
             return Err(log_err!("Unsupported private key"));
         };
@@ -177,6 +192,10 @@ impl Signer {
             }
             SigningKey::SHA384withECDSA(key) => {
                 let sig: P384Signature = key.sign_prehash(hash.as_ref())?;
+                sig.to_vec()
+            }
+            SigningKey::SHA521withECDSA(key) => {
+                let sig: P521Signature = key.sign_prehash(hash.as_ref())?;
                 sig.to_vec()
             }
         };
@@ -222,8 +241,8 @@ impl BootSignature {
         }
         let mut verifier = Verifier::from_public_key(
             self.certificate
-                .tbs_certificate
-                .subject_public_key_info
+                .tbs_certificate()
+                .subject_public_key_info()
                 .owned_to_ref(),
         )?;
         verifier.update(payload);
@@ -310,7 +329,7 @@ pub fn sign_boot_image(
         let sig = signer.sign()?;
 
         // Create BootSignature DER
-        let alg_id = cert.signature_algorithm.clone();
+        let alg_id = cert.signature_algorithm().clone();
         let sig = BootSignature {
             format_version: 1,
             certificate: cert,

@@ -4,8 +4,8 @@
 #include <sys/stat.h>
 #include <memory>
 
-#include <db.hpp>
-#include <daemon.hpp>
+#include <sqlite.hpp>
+#include <core.hpp>
 
 #define DEFAULT_SHELL "/system/bin/sh"
 
@@ -14,6 +14,9 @@
 #define ATTY_OUT   (1 << 1)
 #define ATTY_ERR   (1 << 2)
 
+#define SILENT_ALLOW { SuPolicy::Allow, false, false }
+#define SILENT_DENY  { SuPolicy::Deny, false, false }
+
 class su_info {
 public:
     // Unique key
@@ -21,8 +24,8 @@ public:
 
     // These should be guarded with internal lock
     int eval_uid;  // The effective UID, taking multiuser settings into consideration
-    db_settings cfg;
-    su_access access;
+    struct DbSettings cfg;
+    struct RootSettings access;
     std::string mgr_pkg;
     int mgr_uid;
     void check_db();

@@ -1,5 +1,56 @@
 # Magisk Changelog
 
+### v28.1
+
+- [App] Fix stub APK download link
+- [App] Fix support for Android lower than 8.0
+- [General] Fix support for MTK Samsung devices
+- [MagiskInit] Fix a regression for 2SI devices
+- [MagiskPolicy] Fix a regression causing `overlay.d` replaced files to be not accessible
+
+### v28.0
+
+- [General] Support 16k page size
+- [General] Add basic support for RISC-V (not built in releases)
+- [General] Use a minimal libc to build static executables (`magiskinit` and `magiskboot`) for smaller sizes
+- [Core] Remove unnecessary mirror for magic mount
+- [Core] Update boot image detection logic to support more devices
+- [MagiskInit] Rewrite 2SI logic for injecting `magiskinit` as `init`
+- [MagiskInit] Update preinit partition detection
+- [Zygisk] Update internal JNI hooking implementation
+- [MagiskPolicy] Preserve sepolicy config flag after patching
+- [MagiskPolicy] Optimize patching rules to reduce the amount of new rules being injected
+- [DenyList] Support enforcing denylist when Zygisk is disabled
+- [Resetprop] Improve implementation to workaround several property modification detections
+- [Resetprop] Update to properly work with property overlays
+- [App] Major internal code refactoring
+- [App] Support patching Samsung firmware with images larger than 8GiB
+- [App] Use user-initiated job instead of foreground services on Android 14
+- [App] Support Android 13+ built-in per-app language preferences
+- [App] Add `action.sh` support to allow modules to define an action triggered from UI
+- [MagiskBoot] Support spliting kernel images without decompression
+- [MagiskBoot] Properly support vendor boot images
+- [MagiskBoot] Disable Samsung PROCA from kernel image
+
+### v27.0
+
+- [Zygisk] Introduce new code injection mechanism
+- [Zygisk] Support new signature introduced in U QPR2
+- [SEPolicy] Update libsepol to properly set some policy config bits
+- [MagiskBoot] Support compressing `init` so Magisk is installable on devices with small boot partitions
+- [ResetProp] Add new wait for property feature `resetprop -w`
+
+### v26.4
+
+- [MagiskBoot] Don't pad zeros if signed boot image is larger
+- [MagiskPolicy] Fix `genfscon` and `filename_trans`
+- [MagiskPolicy] Fix bug in `libsepol`
+- [Zygisk] Fix and simplify file descriptor sanitization logic
+- [App] Prevent OOM when patching AP tarfiles
+- [App] Fix bug in device configuration detection
+- [Daemon] Fix certificate parsing of APKs
+- [General] Fix logging errors from C++ code being ignored
+
 ### v26.3
 
 - [General] Fix device information detection script

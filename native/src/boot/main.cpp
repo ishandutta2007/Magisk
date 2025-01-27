@@ -6,6 +6,15 @@
 
 using namespace std;
 
+#ifdef USE_CRT0
+__BEGIN_DECLS
+int musl_vfprintf(FILE *stream, const char *format, va_list arg);
+int vfprintf(FILE *stream, const char *format, va_list arg) {
+    return musl_vfprintf(stream, format, arg);
+}
+__END_DECLS
+#endif
+
 static void print_formats() {
     for (int fmt = GZIP; fmt < LZOP; ++fmt) {
         fprintf(stderr, "%s ", fmt2name[(format_t) fmt]);
@@ -35,7 +44,9 @@ Supported actions:
 
   repack [-n] <origbootimg> [outbootimg]
     Repack boot image components using files from the current directory
-    to [outbootimg], or 'new-boot.img' if not specified.
+    to [outbootimg], or 'new-boot.img' if not specified. Current directory
+    should only contain required files for [outbootimg], or incorrect
+    [outbootimg] may be produced.
     <origbootimg> is the original boot image used to unpack the components.
     By default, each component will be automatically compressed using its
     corresponding format detected in <origbootimg>. If a component file
@@ -79,8 +90,10 @@ Supported actions:
     Do dtb related actions to <file>.
     See "dtb --help" for supported actions.
 
-  split <file>
-    Split image.*-dtb into kernel + kernel_dtb
+  split [-n] <file>
+    Split image.*-dtb into kernel + kernel_dtb.
+    If '-n' is provided, decompression operations will be skipped;
+    the kernel will remain untouched, split in its original format.
 
   sha1 <file>
     Print the SHA1 checksum for <file>
@@ -135,6 +148,8 @@ int main(int argc, char *argv[]) {
         unlink(EXTRA_FILE);
         unlink(RECV_DTBO_FILE);
         unlink(DTB_FILE);
+        unlink(BOOTCONFIG_FILE);
+        rm_rf(VND_RAMDISK_DIR);
     } else if (argc > 2 && action == "sha1") {
         uint8_t sha1[20];
         {
@@ -145,7 +160,13 @@ int main(int argc, char *argv[]) {
             printf("%02x", i);
         printf("\n");
     } else if (argc > 2 && action == "split") {
-        return split_image_dtb(argv[2]);
+        if (argv[2] == "-n"sv) {
+            if (argc == 3)
+                usage(argv[0]);
+            return split_image_dtb(argv[3], true);
+        } else {
+            return split_image_dtb(argv[2]);
+        }
     } else if (argc > 2 && action == "unpack") {
         int idx = 2;
         bool nodecomp = false;
