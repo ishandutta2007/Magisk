@@ -4,10 +4,12 @@ import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.kotlin.dsl.provideDelegate
 import java.io.File
-import java.util.*
+import java.util.Properties
 
 private val props = Properties()
 private var commitHash = ""
+private val supportAbis = setOf("armeabi-v7a", "x86", "arm64-v8a", "x86_64", "riscv64")
+private val defaultAbis = setOf("armeabi-v7a", "x86", "arm64-v8a", "x86_64")
 
 object Config {
     operator fun get(key: String): String? {
@@ -20,13 +22,17 @@ object Config {
     val version: String get() = get("version") ?: commitHash
     val versionCode: Int get() = get("magisk.versionCode")!!.toInt()
     val stubVersion: String get() = get("magisk.stubVersion")!!
+    val abiList: Set<String> get() {
+        val abiList = get("abiList") ?: return defaultAbis
+        return abiList.split(Regex("\\s*,\\s*")).toSet() intersect supportAbis
+    }
 }
 
 class MagiskPlugin : Plugin<Project> {
     override fun apply(project: Project) = project.applyPlugin()
 
     private fun Project.applyPlugin() {
-        initRandom(rootProject.file("dict.txt"))
+        initRandom(rootProject.file("app/dict.txt"))
         props.clear()
         rootProject.file("gradle.properties").inputStream().use { props.load(it) }
         val configPath: String? by this

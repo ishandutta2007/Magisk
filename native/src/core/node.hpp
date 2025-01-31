@@ -5,18 +5,16 @@
 
 using namespace std;
 
-#define TYPE_MIRROR  (1 << 0)    /* mount from mirror */
-#define TYPE_INTER   (1 << 1)    /* intermediate node */
-#define TYPE_TMPFS   (1 << 2)    /* replace with tmpfs */
-#define TYPE_MODULE  (1 << 3)    /* mount from module */
-#define TYPE_ROOT    (1 << 4)    /* partition root */
-#define TYPE_CUSTOM  (1 << 5)    /* custom node type overrides all */
+#define TYPE_INTER   (1 << 0)    /* intermediate node */
+#define TYPE_TMPFS   (1 << 1)    /* replace with tmpfs */
+#define TYPE_MODULE  (1 << 2)    /* mount from module */
+#define TYPE_ROOT    (1 << 3)    /* partition root */
+#define TYPE_CUSTOM  (1 << 4)    /* custom node type overrides all */
 #define TYPE_DIR     (TYPE_INTER|TYPE_TMPFS|TYPE_ROOT)
 
 class node_entry;
 class dir_node;
 class inter_node;
-class mirror_node;
 class tmpfs_node;
 class module_node;
 class root_node;
@@ -27,7 +25,6 @@ template<class T> static T *dyn_cast(node_entry *node);
 template<class T> uint8_t type_id() { return TYPE_CUSTOM; }
 template<> uint8_t type_id<dir_node>() { return TYPE_DIR; }
 template<> uint8_t type_id<inter_node>() { return TYPE_INTER; }
-template<> uint8_t type_id<mirror_node>() { return TYPE_MIRROR; }
 template<> uint8_t type_id<tmpfs_node>() { return TYPE_TMPFS; }
 template<> uint8_t type_id<module_node>() { return TYPE_MODULE; }
 template<> uint8_t type_id<root_node>() { return TYPE_ROOT; }
@@ -40,17 +37,17 @@ public:
     bool is_dir() const { return file_type() == DT_DIR; }
     bool is_lnk() const { return file_type() == DT_LNK; }
     bool is_reg() const { return file_type() == DT_REG; }
+    bool is_wht() const { return file_type() == DT_WHT; }
     const string &name() const { return _name; }
     dir_node *parent() const { return _parent; }
 
     // Don't call the following two functions before prepare
     const string &node_path();
-    string mirror_path() { return mirror_dir + node_path(); }
+    const string worker_path();
 
     virtual void mount() = 0;
 
-    static string module_mnt;
-    static string mirror_dir;
+    inline static string module_mnt;
 
 protected:
     template<class T>
@@ -67,7 +64,7 @@ protected:
         delete other;
     }
 
-    void create_and_mount(const char *reason, const string &src);
+    void create_and_mount(const char *reason, const string &src, bool ro=false);
 
     // Use bit 7 of _file_type for exist status
     bool exist() const { return static_cast<bool>(_file_type & (1 << 7)); }
@@ -108,7 +105,7 @@ public:
      **************/
 
     // Traverse through module directories to generate a tree of module files
-    void collect_module_files(const char *module, int dfd);
+    void collect_module_files(std::string_view module, int dfd);
 
     // Traverse through the real filesystem and prepare the tree for magic mount.
     // Return true to indicate that this node needs to be upgraded to tmpfs_node.
@@ -173,6 +170,12 @@ protected:
     }
 
     template<class T>
+    dir_node(dirent *entry, T *self) : node_entry(entry->d_name, entry->d_type, self) {
+        if constexpr (std::is_same_v<T, root_node>)
+            _root = self;
+    }
+
+    template<class T>
     dir_node(node_entry *node, T *self) : node_entry(self) {
         if constexpr (std::is_same_v<T, root_node>)
             _root = self;
@@ -190,8 +193,8 @@ protected:
 
     // Use bit 6 of _file_type
     // Skip binding mirror for this directory
-    bool skip_mirror() const { return static_cast<bool>(_file_type & (1 << 6)); }
-    void set_skip_mirror(bool b) { if (b) _file_type |= (1 << 6); else _file_type &= ~(1 << 6); }
+    bool replace() const { return static_cast<bool>(_file_type & (1 << 6)); }
+    void set_replace(bool b) { if (b) _file_type |= (1 << 6); else _file_type &= ~(1 << 6); }
 
     template<class T = node_entry>
     T *iterator_to_node(iterator it) {
@@ -271,29 +274,24 @@ public:
 class inter_node : public dir_node {
 public:
     inter_node(const char *name) : dir_node(name, this) {}
+    inter_node(dirent *entry) : dir_node(entry, this) {}
 };
 
 class module_node : public node_entry {
 public:
-    module_node(const char *module, dirent *entry)
+    module_node(std::string_view module, dirent *entry)
     : node_entry(entry->d_name, entry->d_type, this), module(module) {}
 
-    module_node(node_entry *node, const char *module) : node_entry(this), module(module) {
+    module_node(node_entry *node, std::string_view module) : node_entry(this), module(module) {
         node_entry::consume(node);
     }
 
     void mount() override;
 private:
-    const char *module;
+    std::string_view module;
 };
 
-// Don't create the following two nodes before prepare
-class mirror_node : public node_entry {
-public:
-    explicit mirror_node(dirent *entry) : node_entry(entry->d_name, entry->d_type, this) {}
-    void mount() override;
-};
-
+// Don't create tmpfs_node before prepare
 class tmpfs_node : public dir_node {
 public:
     explicit tmpfs_node(node_entry *node);
@@ -313,4 +311,8 @@ const string &node_entry::node_path() {
     if (_parent && _node_path.empty())
         _node_path = _parent->node_path() + '/' + _name;
     return _node_path;
+}
+
+const string node_entry::worker_path() {
+    return get_magisk_tmp() + "/"s WORKERDIR + node_path();
 }

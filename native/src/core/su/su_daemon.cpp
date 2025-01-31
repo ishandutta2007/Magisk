@@ -5,7 +5,7 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 
-#include <magisk.hpp>
+#include <consts.hpp>
 #include <base.hpp>
 #include <selinux.hpp>
 
@@ -18,8 +18,8 @@ static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static shared_ptr<su_info> cached;
 
 su_info::su_info(int uid) :
-uid(uid), eval_uid(-1), access(DEFAULT_SU_ACCESS), mgr_uid(-1),
-timestamp(0), _lock(PTHREAD_MUTEX_INITIALIZER) {}
+uid(uid), eval_uid(-1), cfg(DbSettings()), access(RootSettings()),
+mgr_uid(-1), timestamp(0), _lock(PTHREAD_MUTEX_INITIALIZER) {}
 
 su_info::~su_info() {
     pthread_mutex_destroy(&_lock);
@@ -44,130 +44,40 @@ void su_info::refresh() {
 
 void su_info::check_db() {
     eval_uid = uid;
-    get_db_settings(cfg);
+    auto &daemon = MagiskD();
+    daemon.get_db_settings(cfg);
 
     // Check multiuser settings
-    switch (cfg[SU_MULTIUSER_MODE]) {
-    case MULTIUSER_MODE_OWNER_ONLY:
+    switch (cfg.multiuser_mode) {
+    case MultiuserMode::OwnerOnly:
         if (to_user_id(uid) != 0) {
             eval_uid = -1;
-            access = NO_SU_ACCESS;
+            access = SILENT_DENY;
         }
         break;
-    case MULTIUSER_MODE_OWNER_MANAGED:
+    case MultiuserMode::OwnerManaged:
         eval_uid = to_app_id(uid);
         break;
-    case MULTIUSER_MODE_USER:
+    case MultiuserMode::User:
     default:
         break;
     }
 
     if (eval_uid > 0) {
-        char query[256], *err;
-        ssprintf(query, sizeof(query),
-            "SELECT policy, logging, notification FROM policies "
-            "WHERE uid=%d AND (until=0 OR until>%li)", eval_uid, time(nullptr));
-        err = db_exec(query, [&](db_row &row) -> bool {
-            access.policy = (policy_t) parse_int(row["policy"]);
-            access.log = parse_int(row["logging"]);
-            access.notify = parse_int(row["notification"]);
-            LOGD("magiskdb: query policy=[%d] log=[%d] notify=[%d]\n",
-                 access.policy, access.log, access.notify);
-            return true;
-        });
-        db_err_cmd(err, return);
+        if (!daemon.get_root_settings(eval_uid, access))
+            return;
     }
 
     // We need to check our manager
-    if (access.log || access.notify) {
-        check_pkg_refresh();
-        mgr_uid = get_manager(to_user_id(eval_uid), &mgr_pkg, true);
-    }
-}
-
-bool uid_granted_root(int uid) {
-    if (uid == AID_ROOT)
-        return true;
-
-    db_settings cfg;
-    get_db_settings(cfg);
-
-    // Check user root access settings
-    switch (cfg[ROOT_ACCESS]) {
-    case ROOT_ACCESS_DISABLED:
-        return false;
-    case ROOT_ACCESS_APPS_ONLY:
-        if (uid == AID_SHELL)
-            return false;
-        break;
-    case ROOT_ACCESS_ADB_ONLY:
-        if (uid != AID_SHELL)
-            return false;
-        break;
-    case ROOT_ACCESS_APPS_AND_ADB:
-        break;
-    }
-
-    // Check multiuser settings
-    switch (cfg[SU_MULTIUSER_MODE]) {
-    case MULTIUSER_MODE_OWNER_ONLY:
-        if (to_user_id(uid) != 0)
-            return false;
-        break;
-    case MULTIUSER_MODE_OWNER_MANAGED:
-        uid = to_app_id(uid);
-        break;
-    case MULTIUSER_MODE_USER:
-    default:
-        break;
-    }
-
-    bool granted = false;
-
-    char query[256], *err;
-    ssprintf(query, sizeof(query),
-        "SELECT policy FROM policies WHERE uid=%d AND (until=0 OR until>%li)",
-        uid, time(nullptr));
-    err = db_exec(query, [&](db_row &row) -> bool {
-        granted = parse_int(row["policy"]) == ALLOW;
-        return true;
-    });
-    db_err_cmd(err, return false);
-
-    return granted;
-}
-
-void prune_su_access() {
-    cached.reset();
-    vector<bool> app_no_list = get_app_no_list();
-    vector<int> rm_uids;
-    char query[256], *err;
-    strscpy(query, "SELECT uid FROM policies", sizeof(query));
-    err = db_exec(query, [&](db_row &row) -> bool {
-        int uid = parse_int(row["uid"]);
-        int app_id = to_app_id(uid);
-        if (app_id >= AID_APP_START && app_id <= AID_APP_END) {
-            int app_no = app_id - AID_APP_START;
-            if (app_no >= app_no_list.size() || !app_no_list[app_no]) {
-                // The app_id is no longer installed
-                rm_uids.push_back(uid);
-            }
-        }
-        return true;
-    });
-    db_err_cmd(err, return);
-
-    for (int uid : rm_uids) {
-        ssprintf(query, sizeof(query), "DELETE FROM policies WHERE uid == %d", uid);
-        // Don't care about errors
-        db_exec(query);
+    if (access.policy == SuPolicy::Query || access.log || access.notify) {
+        mgr_uid = daemon.get_manager(to_user_id(eval_uid), &mgr_pkg, true);
     }
 }
 
 static shared_ptr<su_info> get_su_info(unsigned uid) {
     if (uid == AID_ROOT) {
         auto info = make_shared<su_info>(uid);
-        info->access = SILENT_SU_ACCESS;
+        info->access = SILENT_ALLOW;
         return info;
     }
 
@@ -182,45 +92,45 @@ static shared_ptr<su_info> get_su_info(unsigned uid) {
 
     mutex_guard lock = info->lock();
 
-    if (info->access.policy == QUERY) {
+    if (info->access.policy == SuPolicy::Query) {
         // Not cached, get data from database
         info->check_db();
 
         // If it's the manager, allow it silently
         if (to_app_id(info->uid) == to_app_id(info->mgr_uid)) {
-            info->access = SILENT_SU_ACCESS;
+            info->access = SILENT_ALLOW;
             return info;
         }
 
         // Check su access settings
-        switch (info->cfg[ROOT_ACCESS]) {
-            case ROOT_ACCESS_DISABLED:
+        switch (info->cfg.root_access) {
+            case RootAccess::Disabled:
                 LOGW("Root access is disabled!\n");
-                info->access = NO_SU_ACCESS;
+                info->access = SILENT_DENY;
                 break;
-            case ROOT_ACCESS_ADB_ONLY:
+            case RootAccess::AdbOnly:
                 if (info->uid != AID_SHELL) {
                     LOGW("Root access limited to ADB only!\n");
-                    info->access = NO_SU_ACCESS;
+                    info->access = SILENT_DENY;
                 }
                 break;
-            case ROOT_ACCESS_APPS_ONLY:
+            case RootAccess::AppsOnly:
                 if (info->uid == AID_SHELL) {
                     LOGW("Root access is disabled for ADB!\n");
-                    info->access = NO_SU_ACCESS;
+                    info->access = SILENT_DENY;
                 }
                 break;
-            case ROOT_ACCESS_APPS_AND_ADB:
+            case RootAccess::AppsAndAdb:
             default:
                 break;
         }
 
-        if (info->access.policy != QUERY)
+        if (info->access.policy != SuPolicy::Query)
             return info;
 
         // If still not determined, check if manager exists
         if (info->mgr_uid < 0) {
-            info->access = NO_SU_ACCESS;
+            info->access = SILENT_DENY;
             return info;
         }
     }
@@ -266,19 +176,19 @@ void su_daemon_handler(int client, const sock_cred *cred) {
         || !read_vector(client, ctx.req.gids)) {
         LOGW("su: remote process probably died, abort\n");
         ctx.info.reset();
-        write_int(client, DENY);
+        write_int(client, +SuPolicy::Deny);
         close(client);
         return;
     }
 
     // If still not determined, ask manager
-    if (ctx.info->access.policy == QUERY) {
+    if (ctx.info->access.policy == SuPolicy::Query) {
         int fd = app_request(ctx);
         if (fd < 0) {
-            ctx.info->access.policy = DENY;
+            ctx.info->access.policy = SuPolicy::Deny;
         } else {
             int ret = read_int_be(fd);
-            ctx.info->access.policy = ret < 0 ? DENY : static_cast<policy_t>(ret);
+            ctx.info->access.policy = ret < 0 ? SuPolicy::Deny : static_cast<SuPolicy>(ret);
             close(fd);
         }
     }
@@ -289,10 +199,10 @@ void su_daemon_handler(int client, const sock_cred *cred) {
         app_notify(ctx);
 
     // Fail fast
-    if (ctx.info->access.policy == DENY) {
+    if (ctx.info->access.policy == SuPolicy::Deny) {
         LOGW("su: request rejected (%u)\n", ctx.info->uid);
         ctx.info.reset();
-        write_int(client, DENY);
+        write_int(client, +SuPolicy::Deny);
         close(client);
         return;
     }
@@ -342,7 +252,7 @@ void su_daemon_handler(int client, const sock_cred *cred) {
     if (read_int(client)) {
         string pts;
         string ptmx;
-        auto magiskpts = MAGISKTMP + "/" SHELLPTS;
+        auto magiskpts = get_magisk_tmp() + "/"s SHELLPTS;
         if (access(magiskpts.data(), F_OK)) {
             pts = "/dev/pts";
             ptmx = "/dev/ptmx";
@@ -396,19 +306,19 @@ void su_daemon_handler(int client, const sock_cred *cred) {
     if (ctx.req.target == -1)
         ctx.req.target = ctx.pid;
     else if (ctx.req.target == 0)
-        ctx.info->cfg[SU_MNT_NS] = NAMESPACE_MODE_GLOBAL;
-    else if (ctx.info->cfg[SU_MNT_NS] == NAMESPACE_MODE_GLOBAL)
-        ctx.info->cfg[SU_MNT_NS] = NAMESPACE_MODE_REQUESTER;
-    switch (ctx.info->cfg[SU_MNT_NS]) {
-        case NAMESPACE_MODE_GLOBAL:
+        ctx.info->cfg.mnt_ns = MntNsMode::Global;
+    else if (ctx.info->cfg.mnt_ns == MntNsMode::Global)
+        ctx.info->cfg.mnt_ns = MntNsMode::Requester;
+    switch (ctx.info->cfg.mnt_ns) {
+        case MntNsMode::Global:
             LOGD("su: use global namespace\n");
             break;
-        case NAMESPACE_MODE_REQUESTER:
+        case MntNsMode::Requester:
             LOGD("su: use namespace of pid=[%d]\n", ctx.req.target);
             if (switch_mnt_ns(ctx.req.target))
                 LOGD("su: setns failed, fallback to global\n");
             break;
-        case NAMESPACE_MODE_ISOLATE:
+        case MntNsMode::Isolate:
             LOGD("su: use new isolated namespace\n");
             switch_mnt_ns(ctx.req.target);
             xunshare(CLONE_NEWNS);

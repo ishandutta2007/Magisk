@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include <magisk.hpp>
+#include <consts.hpp>
 #include <base.hpp>
 #include <flags.h>
 
@@ -189,7 +189,7 @@ int su_client_main(int argc, char *argv[]) {
     int ptmx, fd;
 
     // Connect to client
-    fd = connect_daemon(MainRequest::SUPERUSER);
+    fd = connect_daemon(+RequestCode::SUPERUSER);
 
     // Send su_request
     xwrite(fd, &su_req, sizeof(su_req_base));

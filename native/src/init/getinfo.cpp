@@ -11,8 +11,6 @@
 
 using namespace std;
 
-vector<string> mount_list;
-
 template<char... cs> using chars = integer_sequence<char, cs...>;
 
 // If quoted, parsing ends when we find char in [breaks]
@@ -41,16 +39,16 @@ static string extract_quoted_str_until(chars<escapes...>, chars<breaks...>,
 }
 
 // Parse string into key value pairs.
-// The string format: [delim][key][padding]=[padding][value][delim]
-template<char delim, char... padding>
+// The string format: [delim][key][padding][eq][padding][value][delim]
+template<char delim, char eq, char... padding>
 static kv_pairs parse_impl(chars<padding...>, string_view str) {
     kv_pairs kv;
-    char skip_array[] = {'=', padding...};
+    char skip_array[] = {eq, padding...};
     string_view skip(skip_array, std::size(skip_array));
     bool quoted = false;
     for (size_t pos = 0u; pos < str.size(); pos = str.find_first_not_of(delim, pos)) {
         auto key = extract_quoted_str_until(
-                chars<padding..., delim>{}, chars<'='>{}, str, pos, quoted);
+                chars<padding..., delim>{}, chars<eq>{}, str, pos, quoted);
         pos = str.find_first_not_of(skip, pos);
         if (pos == string_view::npos || str[pos] == delim) {
             kv.emplace_back(key, "");
@@ -63,10 +61,13 @@ static kv_pairs parse_impl(chars<padding...>, string_view str) {
 }
 
 static kv_pairs parse_cmdline(string_view str) {
-    return parse_impl<' '>(chars<>{}, str);
+    return parse_impl<' ', '='>(chars<>{}, str);
 }
 static kv_pairs parse_bootconfig(string_view str) {
-    return parse_impl<'\n'>(chars<' '>{}, str);
+    return parse_impl<'\n', '='>(chars<' '>{}, str);
+}
+static kv_pairs parse_partition_map(std::string_view str) {
+    return parse_impl<';', ','>(chars<>{}, str);
 }
 
 #define test_bit(bit, array) (array[bit / 8] & (1 << (bit % 8)))
@@ -145,6 +146,12 @@ void BootConfig::set(const kv_pairs &kv) {
             strscpy(fstab_suffix, value.data(), sizeof(fstab_suffix));
         } else if (key == "qemu") {
             emulator = true;
+        } else if (key == "androidboot.partition_map") {
+            // androidboot.partition_map allows mapping a partition name to a raw block device.
+            // For example, "androidboot.partition_map=vdb,metadata;vdc,userdata" maps
+            // "vdb" to "metadata", and "vdc" to "userdata".
+            // https://android.googlesource.com/platform/system/core/+/refs/heads/android13-release/init/devices.cpp#191
+            partition_map = parse_partition_map(value);
         }
     }
 }
@@ -162,41 +169,29 @@ void BootConfig::print() {
 }
 
 #define read_dt(name, key)                                          \
-ssprintf(file_name, sizeof(file_name), "%s/" name, config->dt_dir); \
+ssprintf(file_name, sizeof(file_name), "%s/" name, dt_dir);         \
 if (access(file_name, R_OK) == 0) {                                 \
     string data = full_read(file_name);                             \
     if (!data.empty()) {                                            \
         data.pop_back();                                            \
-        strscpy(config->key, data.data(), sizeof(config->key));     \
+        strscpy(key, data.data(), sizeof(key));                     \
     }                                                               \
 }
 
-void load_kernel_info(BootConfig *config) {
-    // Get kernel data using procfs and sysfs
-    xmkdir("/proc", 0755);
-    xmount("proc", "/proc", "proc", 0, nullptr);
-    xmkdir("/sys", 0755);
-    xmount("sysfs", "/sys", "sysfs", 0, nullptr);
+void BootConfig::init() {
+    set(parse_cmdline(full_read("/proc/cmdline")));
+    set(parse_bootconfig(full_read("/proc/bootconfig")));
 
-    mount_list.emplace_back("/proc");
-    mount_list.emplace_back("/sys");
-
-    // Log to kernel
-    rust::setup_klog();
-
-    config->set(parse_cmdline(full_read("/proc/cmdline")));
-    config->set(parse_bootconfig(full_read("/proc/bootconfig")));
-
-    parse_prop_file("/.backup/.magisk", [=](auto key, auto value) -> bool {
+    parse_prop_file("/.backup/.magisk", [&](auto key, auto value) -> bool {
         if (key == "RECOVERYMODE" && value == "true") {
-            config->skip_initramfs = config->emulator || !check_key_combo();
+            skip_initramfs = emulator || !check_key_combo();
             return false;
         }
         return true;
     });
 
-    if (config->dt_dir[0] == '\0')
-        strscpy(config->dt_dir, DEFAULT_DT_DIR, sizeof(config->dt_dir));
+    if (dt_dir[0] == '\0')
+        strscpy(dt_dir, DEFAULT_DT_DIR, sizeof(dt_dir));
 
     char file_name[128];
     read_dt("fstab_suffix", fstab_suffix)
@@ -204,21 +199,36 @@ void load_kernel_info(BootConfig *config) {
     read_dt("hardware.platform", hardware_plat)
 
     LOGD("Device config:\n");
-    config->print();
+    print();
 }
 
 bool check_two_stage() {
-    if (access("/apex", F_OK) == 0)
+    if (access("/first_stage_ramdisk", F_OK) == 0)
+        return true;
+    if (access("/second_stage_resources", F_OK) == 0)
         return true;
     if (access("/system/bin/init", F_OK) == 0)
+        return true;
+    // Use the apex folder to determine whether 2SI (Android 10+)
+    if (access("/apex", F_OK) == 0)
         return true;
     // If we still have no indication, parse the original init and see what's up
     mmap_data init(backup_init());
     return init.contains("selinux_setup");
 }
 
+static void unxz_init(const char *init_xz, const char *init) {
+    LOGD("unxz %s -> %s\n", init_xz, init);
+    int fd = xopen(init, O_WRONLY | O_CREAT, 0777);
+    fd_stream ch(fd);
+    unxz(ch, mmap_data{init_xz});
+    close(fd);
+    clone_attr(init_xz, init);
+    unlink(init_xz);
+}
+
 const char *backup_init() {
-    if (access("/.backup/init.real", F_OK) == 0)
-        return "/.backup/init.real";
+    if (access("/.backup/init.xz", F_OK) == 0)
+        unxz_init("/.backup/init.xz", "/.backup/init");
     return "/.backup/init";
 }

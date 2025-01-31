@@ -1,6 +1,6 @@
 #include <sys/mount.h>
 
-#include <magisk.hpp>
+#include <consts.hpp>
 #include <base.hpp>
 #include <sys/vfs.h>
 
@@ -8,17 +8,44 @@
 
 using namespace std;
 
-void FirstStageInit::prepare() {
+void MagiskInit::first_stage() {
+    LOGI("First Stage Init\n");
     prepare_data();
-    restore_ramdisk_init();
-    auto init = mmap_data("/init", true);
-    // Redirect original init to magiskinit
-    for (size_t off : init.patch(INIT_PATH, REDIR_PATH)) {
-        LOGD("Patch @ %08zX [" INIT_PATH "] -> [" REDIR_PATH "]\n", off);
+
+    if (struct stat st{}; fstatat(-1, "/sdcard", &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+        fstatat(-1, "/first_stage_ramdisk/sdcard", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (config.force_normal_boot) {
+            xmkdirs("/first_stage_ramdisk/storage/self", 0755);
+            xsymlink("/system/system/bin/init", "/first_stage_ramdisk/storage/self/primary");
+            LOGD("Symlink /first_stage_ramdisk/storage/self/primary -> /system/system/bin/init\n");
+            close(xopen("/first_stage_ramdisk/sdcard", O_RDONLY | O_CREAT | O_CLOEXEC, 0));
+        } else {
+            xmkdirs("/storage/self", 0755);
+            xsymlink("/system/system/bin/init", "/storage/self/primary");
+            LOGD("Symlink /storage/self/primary -> /system/system/bin/init\n");
+        }
+        xrename("/init", "/sdcard");
+        // Try to keep magiskinit in rootfs for samsung RKP
+        if (mount("/sdcard", "/sdcard", nullptr, MS_BIND, nullptr) == 0) {
+            LOGD("Bind mount /sdcard -> /sdcard\n");
+        } else {
+            // rootfs before 3.12
+            xmount(REDIR_PATH, "/sdcard", nullptr, MS_BIND, nullptr);
+            LOGD("Bind mount " REDIR_PATH " -> /sdcard\n");
+        }
+        restore_ramdisk_init();
+    } else {
+        restore_ramdisk_init();
+        // fallback to hexpatch if /sdcard exists
+        auto init = mmap_data("/init", true);
+        // Redirect original init to magiskinit
+        for (size_t off : init.patch(INIT_PATH, REDIR_PATH)) {
+            LOGD("Patch @ %08zX [" INIT_PATH "] -> [" REDIR_PATH "]\n", off);
+        }
     }
 }
 
-void LegacySARInit::first_stage_prep() {
+void MagiskInit::redirect_second_stage() {
     // Patch init binary
     int src = xopen("/init", O_RDONLY);
     int dest = xopen("/data/init", O_CREAT | O_WRONLY, 0);
@@ -35,8 +62,10 @@ void LegacySARInit::first_stage_prep() {
     xmount("/data/init", "/init", nullptr, MS_BIND, nullptr);
 }
 
-bool SecondStageInit::prepare() {
+void MagiskInit::second_stage() {
+    LOGI("Second Stage Init\n");
     umount2("/init", MNT_DETACH);
+    umount2(INIT_PATH, MNT_DETACH); // just in case
     unlink("/data/init");
 
     // Make sure init dmesg logs won't get messed up
@@ -49,7 +78,8 @@ bool SecondStageInit::prepare() {
         // We are still on rootfs, so make sure we will execute the init of the 2nd stage
         unlink("/init");
         xsymlink(INIT_PATH, "/init");
-        return true;
+        patch_rw_root();
+    } else {
+        patch_ro_root();
     }
-    return false;
 }
