@@ -1,128 +1,196 @@
 name: Magisk Build
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "app/**"
-      - "native/**"
-      - "stub/**"
-      - "buildSrc/**"
-      - "build.py"
-      - "gradle.properties"
-      - ".github/workflows/build.yml"
   pull_request:
     branches: [master]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build Magisk artifacts
+    runs-on: macos-15
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-13]
     steps:
       - name: Check out
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          fetch-depth: 0
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
+      - name: Setup environment
+        uses: ./.github/actions/setup
         with:
-          distribution: "temurin"
-          java-version: "17"
-
-      - name: Set up Python 3
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
-
-      - name: Set up sccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          variant: sccache
-          key: ${{ runner.os }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}
-          max-size: 10000M
-
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            !~/.gradle/caches/build-cache-*
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts') }}
-          restore-keys: ${{ runner.os }}-gradle-
-
-      - name: Cache build cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches/build-cache-*
-          key: ${{ runner.os }}-build-cache-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-build-cache-
-
-      - name: Set up NDK
-        run: python build.py -v ndk
+          is-asset-build: true
 
       - name: Build release
-        run: |
-          python build.py -vr all
+        run: ./build.py -vr all
 
       - name: Build debug
-        run: |
-          python build.py -v all
+        run: ./build.py -v all
 
       - name: Stop gradle daemon
         run: ./gradlew --stop
 
-      # Only upload artifacts built on Linux
       - name: Upload build artifact
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.sha }}
           path: out
+          compression-level: 9
 
       - name: Upload mapping and native debug symbols
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.sha }}-symbols
-          path: app/build/outputs
+          path: app/apk/build/outputs
+          compression-level: 9
 
-  test:
-    name: Test on ${{ matrix.api }}
-    runs-on: macos-13
+  test-build:
+    name: Test building on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Setup environment
+        uses: ./.github/actions/setup
+
+      - name: Test build
+        run: python build.py -v -c .github/ci.prop all
+
+      - name: Stop gradle daemon
+        run: ./gradlew --stop
+
+  avd-test:
+    name: Test API ${{ matrix.version }} (x86_64)
+    runs-on: ubuntu-24.04
     needs: build
     strategy:
       fail-fast: false
       matrix:
-        api: [23, 26, 28, 29, 34]
+        version: [23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+        type: [""]
+        include:
+          - version: "Baklava"
+            type: "google_apis"
+          - version: "Baklava"
+            type: "google_apis_ps16k"
 
     steps:
       - name: Check out
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python 3
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
+        uses: actions/checkout@v4
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ github.sha }}
           path: out
 
-      - name: AVD test
+      - name: Enable KVM group perms
         run: |
-          brew install coreutils bash
-          scripts/avd_test.sh ${{ matrix.api }}
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run AVD test
+        timeout-minutes: 10
+        env:
+          AVD_TEST_LOG: 1
+        run: scripts/avd_test.sh ${{ matrix.version }} ${{ matrix.type }}
+
+      - name: Upload logs on error
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "avd-logs-${{ matrix.version }}"
+          path: |
+            kernel.log
+            logcat.log
+
+  avd-test-32:
+    name: Test API ${{ matrix.version }} (x86)
+    runs-on: ubuntu-24.04
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [23, 24, 25, 26, 27, 28, 29, 30]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.sha }}
+          path: out
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run AVD test
+        timeout-minutes: 10
+        env:
+          FORCE_32_BIT: 1
+          AVD_TEST_LOG: 1
+        run: scripts/avd_test.sh ${{ matrix.version }}
+
+      - name: Upload logs on error
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "avd32-logs-${{ matrix.version }}"
+          path: |
+            kernel.log
+            logcat.log
+
+  cf-test:
+    name: Test ${{ matrix.device }}
+    runs-on: ubuntu-24.04
+    needs: build
+    env:
+      CF_HOME: /home/runner/aosp_cf_phone
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: "aosp-main"
+            device: "aosp_cf_x86_64_phone"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.sha }}
+          path: out
+
+      - name: Setup Cuttlefish environment
+        run: |
+          scripts/cuttlefish.sh setup
+          scripts/cuttlefish.sh download ${{ matrix.branch }} ${{ matrix.device }}
+
+      - name: Run Cuttlefish test
+        timeout-minutes: 10
+        run: su $USER -c 'scripts/cuttlefish.sh test'
+
+      - name: Upload logs on error
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "cvd-logs-${{ matrix.device }}"
+          path: |
+            /home/runner/aosp_cf_phone/cuttlefish/instances/cvd-1/logs
+            /home/runner/aosp_cf_phone/cuttlefish/instances/cvd-1/cuttlefish_config.json

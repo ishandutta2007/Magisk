@@ -2,9 +2,10 @@
 #include <sys/syscall.h>
 #include <sys/xattr.h>
 
-#include <magisk.hpp>
+#include <consts.hpp>
 #include <base.hpp>
 #include <selinux.hpp>
+#include <core.hpp>
 #include <flags.h>
 
 using namespace std;
@@ -121,14 +122,18 @@ void restorecon() {
 }
 
 void restore_tmpcon() {
-    if (MAGISKTMP == "/sbin")
-        setfilecon(MAGISKTMP.data(), ROOT_CON);
+    const char *tmp = get_magisk_tmp();
+    if (tmp == "/sbin"sv)
+        setfilecon(tmp, ROOT_CON);
     else
-        chmod(MAGISKTMP.data(), 0711);
+        chmod(tmp, 0711);
 
-    auto dir = xopen_dir(MAGISKTMP.data());
+    auto dir = xopen_dir(tmp);
     int dfd = dirfd(dir.get());
 
     for (dirent *entry; (entry = xreaddir(dir.get()));)
         setfilecon_at(dfd, entry->d_name, SYSTEM_CON);
+
+    string logd = tmp + "/"s LOG_PIPE;
+    setfilecon(logd.data(), MAGISK_LOG_CON);
 }

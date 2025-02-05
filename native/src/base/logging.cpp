@@ -8,6 +8,10 @@
 
 using namespace std;
 
+#ifndef __call_bypassing_fortify
+#define __call_bypassing_fortify(fn) (&fn)
+#endif
+
 #undef vsnprintf
 static int fmt_and_log_with_rs(LogLevel level, const char *fmt, va_list ap) {
     constexpr int sz = 4096;
@@ -15,7 +19,7 @@ static int fmt_and_log_with_rs(LogLevel level, const char *fmt, va_list ap) {
     buf[0] = '\0';
     // Fortify logs when a fatal error occurs. Do not run through fortify again
     int len = std::min(__call_bypassing_fortify(vsnprintf)(buf, sz, fmt, ap), sz - 1);
-    log_with_rs(level, byte_view(buf, len + 1));
+    log_with_rs(level, rust::Utf8CStr(buf, len + 1));
     return len;
 }
 

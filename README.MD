@@ -18,16 +18,18 @@ Some highlight features:
 
 [Github](https://github.com/topjohnwu/Magisk/) is the only source where you can get official Magisk information and downloads.
 
-[![](https://img.shields.io/badge/Magisk-v26.3-blue)](https://github.com/topjohnwu/Magisk/releases/tag/v26.3)
-[![](https://img.shields.io/badge/Magisk%20Beta-v26.3-blue)](https://github.com/topjohnwu/Magisk/releases/tag/v26.3)
-[![](https://img.shields.io/badge/Magisk-Canary-red)](https://raw.githubusercontent.com/topjohnwu/magisk-files/canary/app-release.apk)
-[![](https://img.shields.io/badge/Magisk-Debug-red)](https://raw.githubusercontent.com/topjohnwu/magisk-files/canary/app-debug.apk)
+Click the icon below to download Magisk apk.
+
+[![](https://img.shields.io/badge/Magisk-v28.1-blue)](https://github.com/topjohnwu/Magisk/releases/tag/v28.1)
+[![](https://img.shields.io/badge/Magisk%20Beta-v28.1-blue)](https://github.com/topjohnwu/Magisk/releases/tag/v28.1)
+[![](https://img.shields.io/badge/Magisk-Canary-red)](https://github.com/topjohnwu/Magisk/releases/tag/canary-28102)
 
 ## Useful Links
 
 - [Installation Instruction](https://topjohnwu.github.io/Magisk/install.html)
 - [Building and Development](https://topjohnwu.github.io/Magisk/build.html)
 - [Magisk Documentation](https://topjohnwu.github.io/Magisk/)
+- [Zygisk module sample](https://github.com/topjohnwu/zygisk-module-sample)
 
 ## Bug Reports
 
@@ -41,8 +43,8 @@ For Magisk app crashes, record and upload the logcat when the crash occurs.
 
 Default string resources for the Magisk app and its stub APK are located here:
 
-- `app/src/main/res/values/strings.xml`
-- `stub/src/main/res/values/strings.xml`
+- `app/core/src/main/res/values/strings.xml`
+- `app/stub/src/main/res/values/strings.xml`
 
 Translate each and place them in the respective locations (`[module]/src/main/res/values-[lang]/strings.xml`).
 

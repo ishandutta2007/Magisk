@@ -67,8 +67,6 @@ public final class APKInstall {
     public interface Session {
         // @WorkerThread
         OutputStream openStream(Context context) throws IOException;
-        // @WorkerThread
-        void install(Context context, File apk) throws IOException;
         // @WorkerThread @Nullable
         Intent waitIntent();
     }
@@ -118,7 +116,10 @@ public final class APKInstall {
                         if (onFailure != null) {
                             onFailure.run();
                         }
-                        context.getApplicationContext().unregisterReceiver(this);
+                        try {
+                            context.getApplicationContext().unregisterReceiver(this);
+                        } catch (IllegalArgumentException ignored) {
+                        }
                     }
                 }
                 latch.countDown();
@@ -128,7 +129,10 @@ public final class APKInstall {
         private void onSuccess(Context context) {
             if (onSuccess != null)
                 onSuccess.run();
-            context.getApplicationContext().unregisterReceiver(this);
+            try {
+                context.getApplicationContext().unregisterReceiver(this);
+            } catch (IllegalArgumentException ignored) {
+            }
         }
 
         @Override
@@ -166,14 +170,6 @@ public final class APKInstall {
                     session.close();
                 }
             };
-        }
-
-        @Override
-        public void install(Context context, File apk) throws IOException {
-            try (var src = new FileInputStream(apk);
-                 var out = openStream(context)) {
-                transfer(src, out);
-            }
         }
     }
 }

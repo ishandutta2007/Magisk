@@ -1,6 +1,6 @@
 @Suppress("UnstableApiUsage")
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
     repositories {
         google()
         mavenCentral()
@@ -8,4 +8,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "Magisk"
-include(":app", ":app:shared", ":native", ":stub")
+include(":app:apk", ":app:core", ":app:shared", ":app:stub", ":app:test", ":native")
