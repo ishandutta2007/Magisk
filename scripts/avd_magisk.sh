@@ -18,8 +18,15 @@
 #
 #####################################################################
 
+mount_tmpfs() {
+  # If a file name 'magisk' is in current directory, mount will fail
+  mv magisk magisk.tmp
+  mount -t tmpfs -o 'mode=0755' magisk $1
+  mv magisk.tmp magisk
+}
+
 mount_sbin() {
-  mount -t tmpfs -o 'mode=0755' magisk /sbin
+  mount_tmpfs /sbin
   chcon u:object_r:rootfs:s0 /sbin
 }
 
@@ -37,7 +44,7 @@ if [ -z "$FIRST_STAGE" ]; then
   export ASH_STANDALONE=1
   if [ $(./busybox id -u) -ne 0 ]; then
     # Re-exec script with root
-    exec /system/xbin/su 0 ./busybox sh $0
+    exec /system/xbin/su 0 /data/local/tmp/busybox sh $0
   else
     # Re-exec script with busybox
     exec ./busybox sh $0
@@ -52,18 +59,23 @@ unzip -oj magisk.apk 'assets/util_functions.sh' 'assets/stub.apk'
 
 api_level_arch_detect
 
-unzip -oj magisk.apk "lib/$ABI/*" "lib/$ABI32/libmagisk32.so" -x "lib/$ABI/libbusybox.so"
+unzip -oj magisk.apk "lib/$ABI/*" -x "lib/$ABI/libbusybox.so"
 for file in lib*.so; do
   chmod 755 $file
   mv "$file" "${file:3:${#file}-6}"
 done
 
+if $IS64BIT && [ -e "/system/bin/linker" ]; then
+  unzip -oj magisk.apk "lib/$ABI32/libmagisk.so"
+  mv libmagisk.so magisk32
+  chmod 755 magisk32
+fi
+
 # Stop zygote (and previous setup if exists)
 magisk --stop 2>/dev/null
 stop
-if [ -d /dev/avd-magisk ]; then
-  umount -l /dev/avd-magisk 2>/dev/null
-  rm -rf /dev/avd-magisk 2>/dev/null
+if [ -d /debug_ramdisk ]; then
+  umount -l /debug_ramdisk 2>/dev/null
 fi
 
 # Make sure boot completed props are not set to 1
@@ -92,7 +104,7 @@ elif [ -e /sbin ]; then
   mount_sbin
   mkdir -p /dev/sysroot
   block=$(mount | grep ' / ' | awk '{ print $1 }')
-  [ $block = "/dev/root" ] && block=/dev/block/dm-0
+  [ $block = "/dev/root" ] && block=/dev/block/vda1
   mount -o ro $block /dev/sysroot
   for file in /dev/sysroot/sbin/*; do
     [ ! -e $file ] && break
@@ -108,21 +120,18 @@ elif [ -e /sbin ]; then
   rm -rf /dev/sysroot
 else
   # Android Q+ without sbin
-  MAGISKTMP=/dev/avd-magisk
-  mkdir /dev/avd-magisk
-  # If a file name 'magisk' is in current directory, mount will fail
-  rm -f magisk
-  mount -t tmpfs -o 'mode=0755' magisk /dev/avd-magisk
+  MAGISKTMP=/debug_ramdisk
+  mount_tmpfs /debug_ramdisk
 fi
 
 # Magisk stuff
 mkdir -p $MAGISKBIN 2>/dev/null
 unzip -oj magisk.apk 'assets/*.sh' -d $MAGISKBIN
-mkdir $NVBASE/modules 2>/dev/null
-mkdir $NVBASE/post-fs-data.d 2>/dev/null
-mkdir $NVBASE/service.d 2>/dev/null
+mkdir /data/adb/modules 2>/dev/null
+mkdir /data/adb/post-fs-data.d 2>/dev/null
+mkdir /data/adb/service.d 2>/dev/null
 
-for file in magisk32 magisk64 magiskpolicy stub.apk; do
+for file in magisk magisk32 magiskpolicy stub.apk; do
   chmod 755 ./$file
   cp -af ./$file $MAGISKTMP/$file
   cp -af ./$file $MAGISKBIN/$file
@@ -131,29 +140,22 @@ cp -af ./magiskboot $MAGISKBIN/magiskboot
 cp -af ./magiskinit $MAGISKBIN/magiskinit
 cp -af ./busybox $MAGISKBIN/busybox
 
-if $IS64BIT; then
-  ln -s ./magisk64 $MAGISKTMP/magisk
-else
-  ln -s ./magisk32 $MAGISKTMP/magisk
-fi
 ln -s ./magisk $MAGISKTMP/su
 ln -s ./magisk $MAGISKTMP/resetprop
-ln -s ./magisk $MAGISKTMP/magiskhide
 ln -s ./magiskpolicy $MAGISKTMP/supolicy
 
-mkdir -p $MAGISKTMP/.magisk/mirror
-mkdir $MAGISKTMP/.magisk/block
-mkdir $MAGISKTMP/.magisk/worker
+mkdir -p $MAGISKTMP/.magisk/device
+mkdir -p $MAGISKTMP/.magisk/worker
+mount_tmpfs $MAGISKTMP/.magisk/worker
+mount --make-private $MAGISKTMP/.magisk/worker
 touch $MAGISKTMP/.magisk/config
 
 export MAGISKTMP
 MAKEDEV=1 $MAGISKTMP/magisk --preinit-device 2>&1
 
 RULESCMD=""
-for r in $MAGISKTMP/.magisk/preinit/*/sepolicy.rule; do
-  [ -f "$r" ] || continue
-  RULESCMD="$RULESCMD --apply $r"
-done
+rule="$MAGISKTMP/.magisk/preinit/sepolicy.rule"
+[ -f "$rule" ] && RULESCMD="--apply $rule"
 
 # SELinux stuffs
 if [ -d /sys/fs/selinux ]; then
@@ -170,3 +172,6 @@ fi
 $MAGISKTMP/magisk --post-fs-data
 start
 $MAGISKTMP/magisk --service
+# Make sure reset nb prop after zygote starts
+sleep 2
+$MAGISKTMP/magisk --boot-complete

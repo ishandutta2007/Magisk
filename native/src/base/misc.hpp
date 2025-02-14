@@ -11,11 +11,10 @@
 #include "xwrap.hpp"
 
 #define DISALLOW_COPY_AND_MOVE(clazz) \
-clazz(const clazz &) = delete;        \
+clazz(const clazz&) = delete;        \
 clazz(clazz &&) = delete;
 
 #define ALLOW_MOVE_ONLY(clazz) \
-clazz() = default;             \
 clazz(const clazz&) = delete;  \
 clazz(clazz &&o) { swap(o); }  \
 clazz& operator=(clazz &&o) { swap(o); return *this; }
@@ -206,16 +205,32 @@ private:
     uint8_t arr[N];
 };
 
-class byte_channel;
+class byte_stream;
 
 struct heap_data : public byte_data {
     ALLOW_MOVE_ONLY(heap_data)
 
+    heap_data() = default;
     explicit heap_data(size_t sz) : byte_data(calloc(sz, 1), sz) {}
     ~heap_data() { free(_buf); }
 
-    // byte_channel needs to reallocate the internal buffer
-    friend byte_channel;
+    // byte_stream needs to reallocate the internal buffer
+    friend byte_stream;
+};
+
+struct owned_fd {
+    ALLOW_MOVE_ONLY(owned_fd)
+
+    owned_fd() : fd(-1) {}
+    owned_fd(int fd) : fd(fd) {}
+    ~owned_fd() { close(fd); fd = -1; }
+
+    operator int() { return fd; }
+    int release() { int f = fd; fd = -1; return f; }
+    void swap(owned_fd &owned) { std::swap(fd, owned.fd); }
+
+private:
+    int fd;
 };
 
 rust::Vec<size_t> mut_u8_patch(
@@ -262,9 +277,9 @@ std::vector<std::string> split(std::string_view s, std::string_view delims);
 std::vector<std::string_view> split_view(std::string_view, std::string_view delims);
 
 // Similar to vsnprintf, but the return value is the written number of bytes
-int vssprintf(char *dest, size_t size, const char *fmt, va_list ap);
+__printflike(3, 0) int vssprintf(char *dest, size_t size, const char *fmt, va_list ap);
 // Similar to snprintf, but the return value is the written number of bytes
-int ssprintf(char *dest, size_t size, const char *fmt, ...);
+__printflike(3, 4) int ssprintf(char *dest, size_t size, const char *fmt, ...);
 // This is not actually the strscpy from the Linux kernel.
 // Silently truncates, and returns the number of bytes written.
 extern "C" size_t strscpy(char *dest, const char *src, size_t size);
@@ -310,3 +325,36 @@ void exec_command_async(Args &&...args) {
     };
     exec_command(exec);
 }
+
+template <typename T>
+constexpr auto operator+(T e) noexcept ->
+    std::enable_if_t<std::is_enum<T>::value, std::underlying_type_t<T>> {
+    return static_cast<std::underlying_type_t<T>>(e);
+}
+
+namespace rust {
+
+struct Utf8CStr {
+    const char *data() const;
+    size_t length() const;
+    Utf8CStr(const char *s, size_t len);
+
+    Utf8CStr() : Utf8CStr("", 1) {};
+    Utf8CStr(const Utf8CStr &o) = default;
+    Utf8CStr(Utf8CStr &&o) = default;
+    Utf8CStr(const char *s) : Utf8CStr(s, strlen(s) + 1) {};
+    Utf8CStr(std::string_view s) : Utf8CStr(s.data(), s.length() + 1) {};
+    Utf8CStr(std::string s) : Utf8CStr(s.data(), s.length() + 1) {};
+    const char *c_str() const { return this->data(); }
+    size_t size() const { return this->length(); }
+    bool empty() const { return this->length() == 0 ; }
+    operator std::string_view() { return {data(), length()}; }
+
+private:
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-private-field"
+    std::array<std::uintptr_t, 2> repr;
+#pragma clang diagnostic pop
+};
+
+} // namespace rust

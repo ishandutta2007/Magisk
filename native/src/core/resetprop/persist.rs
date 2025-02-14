@@ -1,4 +1,3 @@
-use core::ffi::c_char;
 use std::io::Read;
 use std::{
     fs::File,
@@ -13,7 +12,7 @@ use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
 use base::libc::{O_CLOEXEC, O_RDONLY};
 use base::{
     clone_attr, cstr, debug, libc::mkstemp, Directory, FsPath, FsPathBuf, LibcReturn, LoggedResult,
-    MappedFile, ResultNoLog, Utf8CStr, Utf8CStrBufArr, WalkResult,
+    MappedFile, SilentResultExt, Utf8CStr, Utf8CStrBufArr, WalkResult,
 };
 
 use crate::ffi::{prop_cb_exec, PropCb};
@@ -39,7 +38,7 @@ trait PropCbExec {
 
 impl PropCbExec for Pin<&mut PropCb> {
     fn exec(&mut self, name: &Utf8CStr, value: &Utf8CStr) {
-        unsafe { prop_cb_exec(self.as_mut(), name.as_ptr(), value.as_ptr()) }
+        unsafe { prop_cb_exec(self.as_mut(), name.as_ptr(), value.as_ptr(), u32::MAX) }
     }
 }
 
@@ -68,7 +67,7 @@ impl PropExt for PersistentProperties {
     }
 
     fn find(&mut self, name: &Utf8CStr) -> LoggedResult<&mut PersistentPropertyRecord> {
-        let idx = self.find_index(name).no_log()?;
+        let idx = self.find_index(name).silent()?;
         Ok(&mut self[idx])
     }
 }
@@ -82,7 +81,7 @@ fn file_get_prop(name: &Utf8CStr) -> LoggedResult<String> {
     let path = FsPathBuf::new(&mut buf)
         .join(PERSIST_PROP_DIR!())
         .join(name);
-    let mut file = path.open(O_RDONLY | O_CLOEXEC).no_log()?;
+    let mut file = path.open(O_RDONLY | O_CLOEXEC).silent()?;
     debug!("resetprop: read prop from [{}]", path);
     let mut s = String::new();
     file.read_to_string(&mut s)?;
@@ -109,7 +108,7 @@ fn file_set_prop(name: &Utf8CStr, value: Option<&Utf8CStr>) -> LoggedResult<()> 
         debug!("resetprop: write prop to [{}]", tmp);
         tmp.rename_to(path)?
     } else {
-        path.remove().no_log()?;
+        path.remove().silent()?;
         debug!("resetprop: unlink [{}]", path);
     }
     Ok(())
@@ -142,9 +141,8 @@ fn proto_write_props(props: &PersistentProperties) -> LoggedResult<()> {
     Ok(())
 }
 
-pub unsafe fn persist_get_prop(name: *const c_char, prop_cb: Pin<&mut PropCb>) {
-    fn inner(name: *const c_char, mut prop_cb: Pin<&mut PropCb>) -> LoggedResult<()> {
-        let name = unsafe { Utf8CStr::from_ptr(name)? };
+pub fn persist_get_prop(name: &Utf8CStr, mut prop_cb: Pin<&mut PropCb>) {
+    let res: LoggedResult<()> = try {
         if check_proto() {
             let mut props = proto_read_props()?;
             let prop = props.find(name)?;
@@ -160,13 +158,12 @@ pub unsafe fn persist_get_prop(name: *const c_char, prop_cb: Pin<&mut PropCb>) {
             prop_cb.exec(name, Utf8CStr::from_string(&mut value));
             debug!("resetprop: found prop [{}] = [{}]", name, value);
         }
-        Ok(())
-    }
-    inner(name, prop_cb).ok();
+    };
+    res.ok();
 }
 
-pub unsafe fn persist_get_props(prop_cb: Pin<&mut PropCb>) {
-    fn inner(mut prop_cb: Pin<&mut PropCb>) -> LoggedResult<()> {
+pub fn persist_get_props(mut prop_cb: Pin<&mut PropCb>) {
+    let res: LoggedResult<()> = try {
         if check_proto() {
             let mut props = proto_read_props()?;
             props.iter_mut().for_each(|prop| {
@@ -192,30 +189,26 @@ pub unsafe fn persist_get_props(prop_cb: Pin<&mut PropCb>) {
                 Ok(WalkResult::Skip)
             })?;
         }
-        Ok(())
-    }
-    inner(prop_cb).ok();
+    };
+    res.ok();
 }
 
-pub unsafe fn persist_delete_prop(name: *const c_char) -> bool {
-    fn inner(name: *const c_char) -> LoggedResult<()> {
-        let name = unsafe { Utf8CStr::from_ptr(name)? };
+pub fn persist_delete_prop(name: &Utf8CStr) -> bool {
+    let res: LoggedResult<()> = try {
         if check_proto() {
             let mut props = proto_read_props()?;
-            let idx = props.find_index(name).no_log()?;
+            let idx = props.find_index(name).silent()?;
             props.remove(idx);
-            proto_write_props(&props)
+            proto_write_props(&props)?;
         } else {
-            file_set_prop(name, None)
+            file_set_prop(name, None)?;
         }
-    }
-    inner(name).is_ok()
+    };
+    res.is_ok()
 }
 
-pub unsafe fn persist_set_prop(name: *const c_char, value: *const c_char) -> bool {
-    unsafe fn inner(name: *const c_char, value: *const c_char) -> LoggedResult<()> {
-        let name = Utf8CStr::from_ptr(name)?;
-        let value = Utf8CStr::from_ptr(value)?;
+pub fn persist_set_prop(name: &Utf8CStr, value: &Utf8CStr) -> bool {
+    let res: LoggedResult<()> = try {
         if check_proto() {
             let mut props = proto_read_props()?;
             match props.find_index(name) {
@@ -228,10 +221,10 @@ pub unsafe fn persist_set_prop(name: *const c_char, value: *const c_char) -> boo
                     },
                 ),
             }
-            proto_write_props(&props)
+            proto_write_props(&props)?;
         } else {
-            file_set_prop(name, Some(value))
+            file_set_prop(name, Some(value))?;
         }
-    }
-    inner(name, value).is_ok()
+    };
+    res.is_ok()
 }

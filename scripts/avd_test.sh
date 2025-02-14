@@ -1,41 +1,19 @@
 #!/usr/bin/env bash
 
-emu="$ANDROID_SDK_ROOT/emulator/emulator"
-avd="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
-sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-emu_args='-no-window -gpu swiftshader_indirect -read-only -no-snapshot -no-audio -no-boot-anim -show-kernel'
-boot_timeout=600
+set -xe
+. scripts/test_common.sh
+
+emu_args_base="-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -read-only -no-snapshot -cores $core_count"
 emu_pid=
 
-# Should be either 'google_apis' or 'default'
-type='default'
-
-# We test these API levels for the following reason
-
-# API 23: legacy rootfs w/o Treble
-# API 26: legacy rootfs with Treble
-# API 28: legacy system-as-root
-# API 29: 2 Stage Init
-# API 34: latest Android
-
-api_list='23 26 28 29 34'
-
-print_title() {
-  echo -e "\n\033[44;39m${1}\033[0m\n"
-}
-
-print_error() {
-  echo -e "\n\033[41;39m${1}\033[0m\n"
-}
+atd_min_api=30
+atd_max_api=35
+huge_ram_min_api=26
 
 cleanup() {
-  print_error "! An error occurred when testing $pkg"
+  print_error "! An error occurred"
 
-  for api in $api_list; do
-    set_api_env $api
-    restore_avd
-  done
-
+  rm -f magisk_patched.img
   "$avd" delete avd -n test
   pkill -INT -P $$
   wait
@@ -44,6 +22,7 @@ cleanup() {
 }
 
 wait_for_bootanim() {
+  set -e
   adb wait-for-device
   while true; do
     local result="$(adb exec-out getprop init.svc.bootanim)"
@@ -57,6 +36,7 @@ wait_for_bootanim() {
 }
 
 wait_for_boot() {
+  set -e
   adb wait-for-device
   while true; do
     local result="$(adb exec-out getprop sys.boot_completed)"
@@ -67,22 +47,6 @@ wait_for_boot() {
     fi
     sleep 2
   done
-}
-
-set_api_env() {
-  pkg="system-images;android-$1;$type;$arch"
-  local img_dir="$ANDROID_SDK_ROOT/system-images/android-$1/$type/$arch"
-  ramdisk="$img_dir/ramdisk.img"
-  features="$img_dir/advancedFeatures.ini"
-}
-
-restore_avd() {
-  if [ -f "${ramdisk}.bak" ]; then
-    cp "${ramdisk}.bak" "$ramdisk"
-  fi
-  if [ -f "${features}.bak" ]; then
-    cp "${features}.bak" "$features"
-  fi
 }
 
 wait_emu() {
@@ -97,84 +61,113 @@ wait_emu() {
   [ $which_pid -eq $wait_pid ]
 }
 
-run_content_cmd() {
-  while true; do
-    local out=$(adb shell echo "'content call --uri content://com.topjohnwu.magisk.provider --method $1'" \| /system/xbin/su | tee /dev/fd/2)
-    if ! grep -q 'Bundle\[' <<< "$out"; then
-      # The call failed, wait a while and retry later
-      sleep 30
-    else
-      grep -q 'result=true' <<< "$out"
-      return $?
-    fi
-  done
-}
-
 test_emu() {
   local variant=$1
+  local api=$2
 
-  print_title "* Testing $pkg ($variant)"
+  print_title "* Testing $avd_pkg ($variant)"
 
-  "$emu" @test $emu_args &
+  if [ -n "$AVD_TEST_LOG" ]; then
+    "$emu" @test $emu_args > kernel.log 2>&1 &
+  else
+    "$emu" @test $emu_args > /dev/null 2>&1 &
+  fi
+
   emu_pid=$!
   wait_emu wait_for_boot
 
-  adb shell magisk -v
+  run_setup $variant
 
-  # Install the Magisk app
-  adb install -r -g out/app-${variant}.apk
-
-  # Use the app to run setup and reboot
-  run_content_cmd setup
   adb reboot
   wait_emu wait_for_boot
 
-  # Run app tests
-  run_content_cmd test
-  adb shell echo "'su -c id'" \| /system/xbin/su 2000 | tee /dev/fd/2 | grep -q 'uid=0'
+  run_tests
 }
 
+test_main() {
+  local ver=$1
+  local type=$2
 
-run_test() {
-  local api=$1
+  # Determine API level
+  local api
+  case $ver in
+    [0-9]*) api=$ver ;;
+    TiramisuPrivacySandbox) api=33 ;;
+    UpsideDownCakePrivacySandbox) api=34 ;;
+    VanillaIceCream) api=35 ;;
+    Baklava) api=36 ;;
+    *)
+      print_error "! Unknown system image version '$ver'"
+      exit 1
+      ;;
+  esac
 
-  set_api_env $api
+  # Determine image type
+  if [ -z $type ]; then
+    if [ $api -ge $atd_min_api -a $api -le $atd_max_api ]; then
+      # Use the lightweight ATD images if possible
+      type='aosp_atd'
+    else
+      type='default'
+    fi
+  fi
+
+  # System image variable and paths
+  local avd_pkg="system-images;android-$ver;$type;$arch"
+  local sys_img_dir="$ANDROID_HOME/system-images/android-$ver/$type/$arch"
+  local ramdisk="$sys_img_dir/ramdisk.img"
+
+  # Old Linux kernels will not boot with memory larger than 3GB
+  local memory
+  if [ $api -lt $huge_ram_min_api ]; then
+    memory=3072
+  else
+    memory=8192
+  fi
+
+  emu_args="$emu_args_base -memory $memory"
 
   # Setup emulator
-  "$sdk" $pkg
-  echo no | "$avd" create avd -f -n test -k $pkg
+  "$sdk" --channel=3 $avd_pkg
+  echo no | "$avd" create avd -f -n test -k $avd_pkg
 
   # Launch stock emulator
-  print_title "* Launching $pkg"
-  restore_avd
-  "$emu" @test $emu_args &
+  print_title "* Launching $avd_pkg"
+  "$emu" @test $emu_args >/dev/null 2>&1 &
   emu_pid=$!
   wait_emu wait_for_bootanim
 
-  # Patch and test debug build
-  ./build.py avd_patch -s "$ramdisk"
-  kill -INT $emu_pid
-  wait $emu_pid
-  test_emu debug
+  # Update arguments for Magisk runs
+  emu_args="$emu_args -ramdisk magisk_patched.img -feature -SystemAsRoot"
+  if [ -n "$AVD_TEST_LOG" ]; then
+    emu_args="$emu_args -show-kernel -logcat '' -logcat-output logcat.log"
+  fi
 
-  # Re-patch and test release build
-  ./build.py -r avd_patch -s "$ramdisk"
-  kill -INT $emu_pid
-  wait $emu_pid
-  test_emu release
+  if [ -z "$AVD_TEST_SKIP_DEBUG" ]; then
+    # Patch and test debug build
+    ./build.py avd_patch -s "$ramdisk" magisk_patched.img
+    kill -INT $emu_pid
+    wait $emu_pid
+    test_emu debug $api
+  fi
+
+  if [ -z "$AVD_TEST_SKIP_RELEASE" ]; then
+    # Patch and test release build
+    ./build.py -r avd_patch -s "$ramdisk" magisk_patched.img
+    kill -INT $emu_pid
+    wait $emu_pid
+    test_emu release $api
+  fi
 
   # Cleanup
   kill -INT $emu_pid
   wait $emu_pid
-  restore_avd
+  rm -f magisk_patched.img
 }
 
 trap cleanup EXIT
-
 export -f wait_for_boot
 export -f wait_for_bootanim
-
-set -xe
 
 case $(uname -m) in
   'arm64'|'aarch64')
@@ -185,15 +178,35 @@ case $(uname -m) in
     ;;
 esac
 
-yes | "$sdk" --licenses
-"$sdk" --channel=3 --update
+if [ -n "$FORCE_32_BIT" ]; then
+  case $arch in
+    'arm64-v8a')
+      echo "! ARM32 is not supported"
+      exit 1
+      ;;
+    'x86_64')
+      arch=x86
+      max_api=$i386_max_api
+      ;;
+  esac
+fi
+
+yes | "$sdk" --licenses > /dev/null
+"$sdk" --channel=3 platform-tools emulator
+
+adb kill-server
+adb start-server
 
 if [ -n "$1" ]; then
-  run_test $1
+  test_main $1 $2
 else
-  for api in $api_list; do
-    run_test $api
+  for api in $(seq 23 35); do
+    test_main $api
   done
+  # Android 16 Beta
+  test_main Baklava google_apis
+  # Run 16k page tests
+  test_main Baklava google_apis_ps16k
 fi
 
 "$avd" delete avd -n test

@@ -1,68 +1,131 @@
-use io::Cursor;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::pin::Pin;
-use std::{io, str};
+#![feature(format_args_nl)]
+#![feature(try_blocks)]
 
 pub use base;
-use base::*;
+use base::libc::{O_CLOEXEC, O_RDONLY};
+use base::{BufReadExt, FsPath, LoggedResult, Utf8CStr};
+use cxx::CxxString;
+use std::fmt::Write;
+use std::io::{BufRead, BufReader, Cursor};
 
-use crate::ffi::sepolicy;
+use crate::ffi::SePolicy;
+
+mod rules;
+mod statement;
 
 #[cxx::bridge]
-mod ffi {
+pub mod ffi {
+    struct Xperm {
+        low: u16,
+        high: u16,
+        reset: bool,
+    }
+
+    struct SePolicy {
+        #[cxx_name = "impl"]
+        _impl: UniquePtr<sepol_impl>,
+    }
+
     unsafe extern "C++" {
-        include!("include/sepolicy.hpp");
+        include!("policy.hpp");
+        include!("../base/include/base.hpp");
 
-        type sepolicy;
-        unsafe fn parse_statement(self: Pin<&mut sepolicy>, stmt: *const c_char, len: i32);
+        #[namespace = "rust"]
+        #[cxx_name = "Utf8CStr"]
+        type Utf8CStrRef<'a> = base::ffi::Utf8CStrRef<'a>;
+
+        type sepol_impl;
+
+        fn allow(self: &mut SePolicy, s: Vec<&str>, t: Vec<&str>, c: Vec<&str>, p: Vec<&str>);
+        fn deny(self: &mut SePolicy, s: Vec<&str>, t: Vec<&str>, c: Vec<&str>, p: Vec<&str>);
+        fn auditallow(self: &mut SePolicy, s: Vec<&str>, t: Vec<&str>, c: Vec<&str>, p: Vec<&str>);
+        fn dontaudit(self: &mut SePolicy, s: Vec<&str>, t: Vec<&str>, c: Vec<&str>, p: Vec<&str>);
+        fn allowxperm(self: &mut SePolicy, s: Vec<&str>, t: Vec<&str>, c: Vec<&str>, p: Vec<Xperm>);
+        fn auditallowxperm(
+            self: &mut SePolicy,
+            s: Vec<&str>,
+            t: Vec<&str>,
+            c: Vec<&str>,
+            p: Vec<Xperm>,
+        );
+        fn dontauditxperm(
+            self: &mut SePolicy,
+            s: Vec<&str>,
+            t: Vec<&str>,
+            c: Vec<&str>,
+            p: Vec<Xperm>,
+        );
+        fn permissive(self: &mut SePolicy, t: Vec<&str>);
+        fn enforce(self: &mut SePolicy, t: Vec<&str>);
+        fn typeattribute(self: &mut SePolicy, t: Vec<&str>, a: Vec<&str>);
+        #[cxx_name = "type"]
+        fn type_(self: &mut SePolicy, t: &str, a: Vec<&str>);
+        fn attribute(self: &mut SePolicy, t: &str);
+        fn type_transition(self: &mut SePolicy, s: &str, t: &str, c: &str, d: &str, o: &str);
+        fn type_change(self: &mut SePolicy, s: &str, t: &str, c: &str, d: &str);
+        fn type_member(self: &mut SePolicy, s: &str, t: &str, c: &str, d: &str);
+        fn genfscon(self: &mut SePolicy, s: &str, t: &str, c: &str);
+        #[allow(dead_code)]
+        fn strip_dontaudit(self: &mut SePolicy);
+
+        fn print_rules(self: &SePolicy);
+        fn to_file(self: &SePolicy, file: Utf8CStrRef) -> bool;
+
+        #[Self = SePolicy]
+        fn from_file(file: Utf8CStrRef) -> SePolicy;
+        #[Self = SePolicy]
+        fn from_split() -> SePolicy;
+        #[Self = SePolicy]
+        fn compile_split() -> SePolicy;
+        #[Self = SePolicy]
+        unsafe fn from_data(data: *mut c_char, len: usize) -> SePolicy;
     }
 
-    #[namespace = "rust"]
     extern "Rust" {
-        fn load_rules(sepol: Pin<&mut sepolicy>, rules: &[u8]);
-        fn load_rule_file(sepol: Pin<&mut sepolicy>, filename: &[u8]);
+        fn parse_statement(self: &mut SePolicy, statement: Utf8CStrRef);
+        fn magisk_rules(self: &mut SePolicy);
+        fn load_rule_file(self: &mut SePolicy, filename: Utf8CStrRef);
+        fn load_rules(self: &mut SePolicy, rules: &CxxString);
+        #[Self = SePolicy]
+        fn xperm_to_string(perm: &Xperm) -> String;
+        #[Self = SePolicy]
+        fn print_statement_help();
     }
 }
 
-trait SepolicyExt {
-    fn load_rules(self: Pin<&mut Self>, rules: &[u8]);
-    fn load_rule_file(self: Pin<&mut Self>, filename: &[u8]);
-    fn load_rules_from_reader<T: BufRead>(self: Pin<&mut Self>, reader: &mut T);
-}
-
-impl SepolicyExt for sepolicy {
-    fn load_rules(self: Pin<&mut sepolicy>, rules: &[u8]) {
-        let mut cursor = Cursor::new(rules);
+impl SePolicy {
+    fn load_rules(self: &mut SePolicy, rules: &CxxString) {
+        let mut cursor = Cursor::new(rules.as_bytes());
         self.load_rules_from_reader(&mut cursor);
     }
 
-    fn load_rule_file(self: Pin<&mut sepolicy>, filename: &[u8]) {
-        fn inner(sepol: Pin<&mut sepolicy>, filename: &[u8]) -> LoggedResult<()> {
-            let filename = str::from_utf8(filename)?;
-            let mut reader = BufReader::new(File::open(filename)?);
-            sepol.load_rules_from_reader(&mut reader);
-            Ok(())
-        }
-        inner(self, filename).ok();
+    pub fn load_rule_file(self: &mut SePolicy, filename: &Utf8CStr) {
+        let result: LoggedResult<()> = try {
+            let file = FsPath::from(filename).open(O_RDONLY | O_CLOEXEC)?;
+            let mut reader = BufReader::new(file);
+            self.load_rules_from_reader(&mut reader);
+        };
+        result.ok();
     }
 
-    fn load_rules_from_reader<T: BufRead>(mut self: Pin<&mut sepolicy>, reader: &mut T) {
+    fn load_rules_from_reader<T: BufRead>(self: &mut SePolicy, reader: &mut T) {
         reader.foreach_lines(|line| {
-            let bytes = line.trim().as_bytes();
-            unsafe {
-                self.as_mut()
-                    .parse_statement(bytes.as_ptr().cast(), bytes.len() as i32);
-            }
+            self.parse_statement(line);
             true
         });
     }
-}
 
-pub fn load_rule_file(sepol: Pin<&mut sepolicy>, filename: &[u8]) {
-    sepol.load_rule_file(filename);
-}
-
-pub fn load_rules(sepol: Pin<&mut sepolicy>, rules: &[u8]) {
-    sepol.load_rules(rules);
+    fn xperm_to_string(perm: &ffi::Xperm) -> String {
+        let mut s = String::new();
+        if perm.reset {
+            s.push('~');
+        }
+        if perm.low == perm.high {
+            s.write_fmt(format_args!("{{ {:#06X} }}", perm.low)).ok();
+        } else {
+            s.write_fmt(format_args!("{{ {:#06X}-{:#06X} }}", perm.low, perm.high))
+                .ok();
+        }
+        s
+    }
 }

@@ -1,8 +1,11 @@
 import com.android.build.api.artifact.ArtifactTransformationRequest
 import com.android.build.api.artifact.SingleArtifact
 import com.android.build.api.dsl.ApkSigningConfig
+import com.android.build.api.instrumentation.FramesComputationMode.COMPUTE_FRAMES_FOR_INSTRUMENTED_METHODS
+import com.android.build.api.instrumentation.InstrumentationScope
 import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 import com.android.build.gradle.BaseExtension
+import com.android.build.gradle.LibraryExtension
 import com.android.build.gradle.internal.dsl.BaseAppModuleExtension
 import com.android.builder.internal.packaging.IncrementalPackager
 import com.android.tools.build.apkzlib.sign.SigningExtension
@@ -15,8 +18,8 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.JavaVersion
 import org.gradle.api.Project
 import org.gradle.api.file.DirectoryProperty
-import org.gradle.api.plugins.ExtensionAware
 import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputFiles
@@ -25,6 +28,8 @@ import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.StopExecutionException
 import org.gradle.api.tasks.Sync
 import org.gradle.api.tasks.TaskAction
+import org.gradle.kotlin.dsl.assign
+import org.gradle.kotlin.dsl.exclude
 import org.gradle.kotlin.dsl.filter
 import org.gradle.kotlin.dsl.get
 import org.gradle.kotlin.dsl.getValue
@@ -32,12 +37,16 @@ import org.gradle.kotlin.dsl.named
 import org.gradle.kotlin.dsl.provideDelegate
 import org.gradle.kotlin.dsl.register
 import org.gradle.kotlin.dsl.registering
-import org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension
-import org.jetbrains.kotlin.gradle.dsl.KotlinJvmOptions
+import org.gradle.kotlin.dsl.withType
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.URI
 import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.cert.X509Certificate
+import java.util.HexFormat
 import java.util.jar.JarFile
 import java.util.zip.Deflater
 import java.util.zip.DeflaterOutputStream
@@ -51,45 +60,167 @@ private fun Project.androidBase(configure: Action<BaseExtension>) =
 private fun Project.android(configure: Action<BaseAppModuleExtension>) =
     extensions.configure("android", configure)
 
-private fun BaseExtension.kotlinOptions(configure: Action<KotlinJvmOptions>) =
-    (this as ExtensionAware).extensions.findByName("kotlinOptions")?.let {
-        configure.execute(it as KotlinJvmOptions)
-    }
-
-private fun BaseExtension.kotlin(configure: Action<KotlinAndroidProjectExtension>) =
-    (this as ExtensionAware).extensions.findByName("kotlin")?.let {
-        configure.execute(it as KotlinAndroidProjectExtension)
-    }
-
-private val Project.android: BaseAppModuleExtension
+private val Project.androidApp: BaseAppModuleExtension
     get() = extensions["android"] as BaseAppModuleExtension
+
+private val Project.androidLib: LibraryExtension
+    get() = extensions["android"] as LibraryExtension
 
 private val Project.androidComponents
     get() = extensions.getByType(ApplicationAndroidComponentsExtension::class.java)
 
 fun Project.setupCommon() {
     androidBase {
-        compileSdkVersion(34)
-        buildToolsVersion = "34.0.0"
+        compileSdkVersion(35)
+        buildToolsVersion = "35.0.1"
         ndkPath = "$sdkDirectory/ndk/magisk"
+        ndkVersion = "28.0.12674087"
 
         defaultConfig {
             minSdk = 23
-            targetSdk = 34
         }
 
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_17
-            targetCompatibility = JavaVersion.VERSION_17
+            sourceCompatibility = JavaVersion.VERSION_21
+            targetCompatibility = JavaVersion.VERSION_21
         }
 
-        kotlinOptions {
-            jvmTarget = "17"
+        packagingOptions {
+            resources {
+                excludes += arrayOf(
+                    "/META-INF/*",
+                    "/META-INF/versions/**",
+                    "/org/bouncycastle/**",
+                    "/org/apache/commons/**",
+                    "/kotlin/**",
+                    "/kotlinx/**",
+                    "/okhttp3/**",
+                    "/*.txt",
+                    "/*.bin",
+                    "/*.json",
+                )
+            }
+        }
+    }
+
+    configurations.all {
+        exclude("org.jetbrains.kotlin", "kotlin-stdlib-jdk7")
+        exclude("org.jetbrains.kotlin", "kotlin-stdlib-jdk8")
+    }
+
+    tasks.withType<KotlinCompile> {
+        compilerOptions {
+            jvmTarget = JvmTarget.JVM_21
+        }
+    }
+}
+
+const val BUSYBOX_DOWNLOAD_URL =
+    "https://github.com/topjohnwu/magisk-files/releases/download/files/busybox-1.36.1.1.zip"
+const val BUSYBOX_ZIP_CHECKSUM =
+    "b4d0551feabaf314e53c79316c980e8f66432e9fb91a69dbbf10a93564b40951"
+
+fun Project.setupCoreLib() {
+    setupCommon()
+
+    val abiList = Config.abiList
+
+    val syncLibs by tasks.registering(Sync::class) {
+        into("src/main/jniLibs")
+        for (abi in abiList) {
+            into(abi) {
+                from(rootProject.file("native/out/$abi")) {
+                    include("magiskboot", "magiskinit", "magiskpolicy", "magisk", "libinit-ld.so")
+                    rename { if (it.endsWith(".so")) it else "lib$it.so" }
+                }
+            }
+        }
+        onlyIf {
+            if (inputs.sourceFiles.files.size != abiList.size * 5)
+                throw StopExecutionException("Please build binaries first! (./build.py binary)")
+            true
+        }
+    }
+
+    val downloadBusybox by tasks.registering(Copy::class) {
+        dependsOn(syncLibs)
+        val bb = layout.buildDirectory.file(BUSYBOX_ZIP_CHECKSUM).get().asFile
+        if (bb.exists()) {
+            val md = MessageDigest.getInstance("SHA-256")
+            bb.inputStream().use { md.update(it.readAllBytes()) }
+            val hash = HexFormat.of().formatHex(md.digest())
+            if (hash != BUSYBOX_ZIP_CHECKSUM) {
+                bb.delete()
+            }
+        }
+        if (!bb.exists()) {
+            bb.parentFile.mkdirs()
+            URI(BUSYBOX_DOWNLOAD_URL).toURL().openStream().use { dl ->
+                bb.outputStream().use {
+                    dl.copyTo(it)
+                }
+            }
+        }
+        from(zipTree(bb))
+        include(abiList.map { "$it/libbusybox.so" })
+        into("src/main/jniLibs")
+    }
+
+    val syncResources by tasks.registering(Sync::class) {
+        into("src/main/resources/META-INF/com/google/android")
+        from(rootProject.file("scripts/update_binary.sh")) {
+            rename { "update-binary" }
+        }
+        from(rootProject.file("scripts/flash_script.sh")) {
+            rename { "updater-script" }
+        }
+    }
+
+    androidLib.libraryVariants.all {
+        val variantCapped = name.replaceFirstChar { it.uppercase() }
+
+        tasks.getByPath("merge${variantCapped}JniLibFolders").dependsOn(downloadBusybox)
+        processJavaResourcesProvider.configure { dependsOn(syncResources) }
+
+        val stubTask = tasks.getByPath(":app:stub:comment$variantCapped")
+        val stubApk = stubTask.outputs.files.asFileTree.filter {
+            it.name.endsWith(".apk")
         }
 
-        kotlin {
-            jvmToolchain(17)
+        val syncAssets = tasks.register("sync${variantCapped}Assets", Sync::class) {
+            dependsOn(stubTask)
+            inputs.property("version", Config.version)
+            inputs.property("versionCode", Config.versionCode)
+            into("src/${this@all.name}/assets")
+            from(rootProject.file("scripts")) {
+                include("util_functions.sh", "boot_patch.sh", "addon.d.sh",
+                    "app_functions.sh", "uninstaller.sh", "module_installer.sh")
+            }
+            from(rootProject.file("tools/bootctl"))
+            into("chromeos") {
+                from(rootProject.file("tools/futility"))
+                from(rootProject.file("tools/keys")) {
+                    include("kernel_data_key.vbprivk", "kernel.keyblock")
+                }
+            }
+            from(stubApk) {
+                rename { "stub.apk" }
+            }
+            filesMatching("**/util_functions.sh") {
+                filter {
+                    it.replace(
+                        "#MAGISK_VERSION_STUB",
+                        "MAGISK_VER='${Config.version}'\nMAGISK_VER_CODE=${Config.versionCode}"
+                    )
+                }
+                filter<FixCrLfFilter>("eol" to FixCrLfFilter.CrLf.newInstance("lf"))
+            }
         }
+        mergeAssetsProvider.configure { dependsOn(syncAssets) }
+    }
+
+    tasks.named<Delete>("clean") {
+        delete.addAll(listOf("src/main/jniLibs", "src/main/resources", "src/debug", "src/release"))
     }
 }
 
@@ -137,12 +268,13 @@ abstract class AddCommentTask: DefaultTask() {
             noTimestamps = true
             autoSortFiles = true
         }
-        outFile.parentFile.mkdirs()
+        outFile.parentFile?.mkdirs()
         inFile.copyTo(outFile, overwrite = true)
         ZFiles.apk(outFile, options).use {
             SigningExtension(signingOptions).register(it)
             it.eocdComment = comment.get().toByteArray()
             it.get(IncrementalPackager.APP_METADATA_ENTRY_PATH)?.delete()
+            it.get(IncrementalPackager.VERSION_CONTROL_INFO_ENTRY_PATH)?.delete()
             it.get(JarFile.MANIFEST_NAME)?.delete()
         }
 
@@ -150,7 +282,7 @@ abstract class AddCommentTask: DefaultTask() {
     }
 }
 
-private fun Project.setupAppCommon() {
+fun Project.setupAppCommon() {
     setupCommon()
 
     android {
@@ -163,6 +295,13 @@ private fun Project.setupAppCommon() {
                     keyPassword = Config["keyPass"]
                 }
             }
+        }
+
+        defaultConfig {
+            targetSdk = 35
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt")
+            )
         }
 
         buildTypes {
@@ -187,10 +326,6 @@ private fun Project.setupAppCommon() {
             includeInApk = false
         }
 
-        buildFeatures {
-            buildConfig = true
-        }
-
         packaging {
             jniLibs {
                 useLegacyPackaging = true
@@ -206,109 +341,46 @@ private fun Project.setupAppCommon() {
         val transformationRequest = variant.artifacts.use(commentTask)
             .wiredWithDirectories(AddCommentTask::apkFolder, AddCommentTask::outFolder)
             .toTransformMany(SingleArtifact.APK)
-        val signingConfig = android.buildTypes.getByName(variant.buildType!!).signingConfig
+        val signingConfig = androidApp.buildTypes.getByName(variant.buildType!!).signingConfig
         commentTask.configure {
-            this.transformationRequest.set(transformationRequest)
-            this.signingConfig.set(signingConfig)
-            this.comment.set("version=${Config.version}\n" +
+            this.transformationRequest = transformationRequest
+            this.signingConfig = signingConfig
+            this.comment = "version=${Config.version}\n" +
                 "versionCode=${Config.versionCode}\n" +
-                "stubVersion=${Config.stubVersion}\n")
+                "stubVersion=${Config.stubVersion}\n"
             this.outFolder.set(layout.buildDirectory.dir("outputs/apk/${variant.name}"))
         }
     }
 }
 
-fun Project.setupApp() {
+fun Project.setupMainApk() {
     setupAppCommon()
 
-    val syncLibs by tasks.registering(Sync::class) {
-        into("src/main/jniLibs")
-        into("armeabi-v7a") {
-            from(rootProject.file("native/out/armeabi-v7a")) {
-                include("busybox", "magiskboot", "magiskinit", "magiskpolicy", "magisk")
-                rename { if (it == "magisk") "libmagisk32.so" else "lib$it.so" }
-            }
-        }
-        into("x86") {
-            from(rootProject.file("native/out/x86")) {
-                include("busybox", "magiskboot", "magiskinit", "magiskpolicy", "magisk")
-                rename { if (it == "magisk") "libmagisk32.so" else "lib$it.so" }
-            }
-        }
-        into("arm64-v8a") {
-            from(rootProject.file("native/out/arm64-v8a")) {
-                include("busybox", "magiskboot", "magiskinit", "magiskpolicy", "magisk")
-                rename { if (it == "magisk") "libmagisk64.so" else "lib$it.so" }
-            }
-        }
-        into("x86_64") {
-            from(rootProject.file("native/out/x86_64")) {
-                include("busybox", "magiskboot", "magiskinit", "magiskpolicy", "magisk")
-                rename { if (it == "magisk") "libmagisk64.so" else "lib$it.so" }
-            }
-        }
-        onlyIf {
-            if (inputs.sourceFiles.files.size != 20)
-                throw StopExecutionException("Please build binaries first! (./build.py binary)")
-            true
-        }
-    }
+    android {
+        namespace = "com.topjohnwu.magisk"
 
-    val syncResources by tasks.registering(Sync::class) {
-        into("src/main/resources/META-INF/com/google/android")
-        from(rootProject.file("scripts/update_binary.sh")) {
-            rename { "update-binary" }
-        }
-        from(rootProject.file("scripts/flash_script.sh")) {
-            rename { "updater-script" }
-        }
-    }
-
-    android.applicationVariants.all {
-        val variantCapped = name.replaceFirstChar { it.uppercase() }
-
-        tasks.getByPath("merge${variantCapped}JniLibFolders").dependsOn(syncLibs)
-        processJavaResourcesProvider.configure { dependsOn(syncResources) }
-
-        val stubTask = tasks.getByPath(":stub:comment$variantCapped")
-        val stubApk = stubTask.outputs.files.asFileTree.filter {
-            it.name.endsWith(".apk")
+        defaultConfig {
+            applicationId = "com.topjohnwu.magisk"
+            vectorDrawables.useSupportLibrary = true
+            versionName = Config.version
+            versionCode = Config.versionCode
+            ndk {
+                abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64", "riscv64")
+                debugSymbolLevel = "FULL"
+            }
         }
 
-        val syncAssets = tasks.register("sync${variantCapped}Assets", Sync::class) {
-            dependsOn(stubTask)
-            inputs.property("version", Config.version)
-            inputs.property("versionCode", Config.versionCode)
-            into("src/${this@all.name}/assets")
-            from(rootProject.file("scripts")) {
-                include("util_functions.sh", "boot_patch.sh", "addon.d.sh")
-                include("uninstaller.sh", "module_installer.sh")
-            }
-            from(rootProject.file("tools/bootctl"))
-            into("chromeos") {
-                from(rootProject.file("tools/futility"))
-                from(rootProject.file("tools/keys")) {
-                    include("kernel_data_key.vbprivk", "kernel.keyblock")
-                }
-            }
-            from(stubApk) {
-                rename { "stub.apk" }
-            }
-            filesMatching("**/util_functions.sh") {
-                filter {
-                    it.replace(
-                        "#MAGISK_VERSION_STUB",
-                        "MAGISK_VER='${Config.version}'\nMAGISK_VER_CODE=${Config.versionCode}"
-                    )
-                }
-                filter<FixCrLfFilter>("eol" to FixCrLfFilter.CrLf.newInstance("lf"))
+        androidComponents.onVariants { variant ->
+            variant.instrumentation.apply {
+                setAsmFramesComputationMode(COMPUTE_FRAMES_FOR_INSTRUMENTED_METHODS)
+                transformClassesWith(
+                    DesugarClassVisitorFactory::class.java, InstrumentationScope.ALL) {}
             }
         }
-        mergeAssetsProvider.configure { dependsOn(syncAssets) }
     }
 }
 
-fun Project.setupStub() {
+fun Project.setupStubApk() {
     setupAppCommon()
 
     androidComponents.onVariants { variant ->
@@ -317,7 +389,7 @@ fun Project.setupStub() {
         val manifestUpdater =
             project.tasks.register("${variantName}ManifestProducer", ManifestUpdater::class.java) {
                 dependsOn("generate${variantCapped}ObfuscatedClass")
-                applicationId.set(variant.applicationId)
+                applicationId = variant.applicationId
                 appClassDir.set(layout.buildDirectory.dir("generated/source/app/$variantName"))
                 factoryClassDir.set(layout.buildDirectory.dir("generated/source/factory/$variantName"))
             }
@@ -328,15 +400,15 @@ fun Project.setupStub() {
             .toTransform(SingleArtifact.MERGED_MANIFEST)
     }
 
-    android.applicationVariants.all {
+    androidApp.applicationVariants.all {
         val variantCapped = name.replaceFirstChar { it.uppercase() }
         val variantLowered = name.lowercase()
         val outFactoryClassDir = layout.buildDirectory.file("generated/source/factory/${variantLowered}").get().asFile
         val outAppClassDir = layout.buildDirectory.file("generated/source/app/${variantLowered}").get().asFile
         val outResDir = layout.buildDirectory.dir("generated/source/res/${variantLowered}").get().asFile
-        val aapt = File(android.sdkDirectory, "build-tools/${android.buildToolsVersion}/aapt2")
-        val apk = layout.buildDirectory.file("intermediates/processed_res/" +
-            "${variantLowered}/out/resources-${variantLowered}.ap_").get().asFile
+        val aapt = File(androidApp.sdkDirectory, "build-tools/${androidApp.buildToolsVersion}/aapt2")
+        val apk = layout.buildDirectory.file("intermediates/linked_resources_binary_format/" +
+            "${variantLowered}/process${variantCapped}Resources/linked-resources-binary-format-${variantLowered}.ap_").get().asFile
 
         val genManifestTask = tasks.register("generate${variantCapped}ObfuscatedClass") {
             inputs.property("seed", RAND_SEED)
@@ -377,10 +449,10 @@ fun Project.setupStub() {
         registerJavaGeneratingTask(processResourcesTask, outResDir)
     }
     // Override optimizeReleaseResources task
-    val apk = layout.buildDirectory.file("intermediates/processed_res/" +
-        "release/out/resources-release.ap_").get().asFile
+    val apk = layout.buildDirectory.file("intermediates/linked_resources_binary_format/" +
+        "release/processReleaseResources/linked-resources-binary-format-release.ap_").get().asFile
     val optRes = layout.buildDirectory.file("intermediates/optimized_processed_res/" +
-        "release/resources-release-optimize.ap_").get().asFile
+        "release/optimizeReleaseResources/resources-release-optimize.ap_").get().asFile
     afterEvaluate {
         tasks.named("optimizeReleaseResources") {
             doLast { apk.copyTo(optRes, true) }
