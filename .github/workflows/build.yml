@@ -88,9 +88,9 @@ jobs:
         version: [23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
         type: [""]
         include:
-          - version: "Baklava"
+          - version: 36
             type: "google_apis"
-          - version: "Baklava"
+          - version: 36
             type: "google_apis_ps16k"
 
     steps:
@@ -177,8 +177,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - branch: "aosp-main"
-            device: "aosp_cf_x86_64_phone"
+          - branch: "aosp-android-latest-release"
+            device: "aosp_cf_x86_64_only_phone"
 
     steps:
       - name: Check out
