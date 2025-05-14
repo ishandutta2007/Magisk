@@ -294,7 +294,7 @@ fun Project.setupAppCommon() {
         signingConfigs {
             create("config") {
                 Config["keyStore"]?.also {
-                    storeFile = File(baseDir, it)
+                    storeFile = File(it)
                     storePassword = Config["keyStorePass"]
                     keyAlias = Config["keyAlias"]
                     keyPassword = Config["keyPass"]
